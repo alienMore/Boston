@@ -12,7 +12,6 @@ object Boston extends App {
   val filenameCRIME = args(0)
   val filenameOFFENSE_CODES = args(1)
   val pathToParquet = args(2)
-  //val filenameOFFENSE = args(1)
 
   import spark.implicits._
   Logger.getLogger("org").setLevel(Level.OFF)
@@ -20,53 +19,60 @@ object Boston extends App {
   val crime = spark.read.format("csv")
     .option("header", "true")
     .option("inferSchema", "true")
-    //.load("/home/admin/IdeaProjects/bostonsurin/data/crime.csv")
+    ///.load("/home/admin/IdeaProjects/bostonsurin/data/crime.csv")
     .load(filenameCRIME)
   val offense_codes = spark.read.format("csv").option("header", "true").option("inferSchema", "true")
-    //.load("/home/admin/IdeaProjects/bostonsurin/data/offense_codes.csv")
+    ///.load("/home/admin/IdeaProjects/bostonsurin/data/offense_codes.csv")
     .load(filenameOFFENSE_CODES)
-  val MAINcrime = crime
-    .groupBy( $"DISTRICT")
-    .agg(avg("Lat") as "lat",
-      avg("Long") as "lng",
-      count("INCIDENT_NUMBER").name("crimes_total"))
-    .createOrReplaceTempView("MAINcrime")
+  crime
+    .groupBy( $"DISTRICT",$"YEAR",$"MONTH")
+    .count()
+    .sort($"count")
+    .createOrReplaceTempView("TMPmedian")
 
-  crime.createOrReplaceTempView("month")
-  spark.sql("SELECT DISTRICT,MONTH, count(MONTH) as PER_MONTH FROM month group by DISTRICT,MONTH")
-     .createOrReplaceTempView("TMPmedian")
-  spark.sql("SELECT DISTRICT as mDISTRICT,percentile_approx(PER_MONTH, 0.5) as crimes_monthly FROM TMPmedian group by DISTRICT order by DISTRICT")
-     .createOrReplaceTempView("MAINmedian")
+  //Get median
+  spark.sql("SELECT DISTRICT as DISTRICT,percentile_approx(count, 0.5) as crimes_monthly FROM TMPmedian group by DISTRICT order by DISTRICT")
+    .na.fill("UnknownDistrict")
+  .createOrReplaceTempView("median")
 
-  spark.sql("SELECT * FROM MAINcrime LEFT JOIN MAINmedian ON MAINcrime.DISTRICT = MAINmedian.mDISTRICT")
+  crime
+    .groupBy($"DISTRICT")
+    .agg(count("INCIDENT_NUMBER").name("crimes_total"),
+         avg("Lat") as "lat",
+         avg("Long") as "lng")
+    .na.fill("UnknownDistrict")
     .createOrReplaceTempView("MAINresult")
 
-  case class countName(DISTRICT: String, NAME: String, CODE: Int, count: Long)
-  crime.join(broadcast(offense_codes), crime.col("OFFENSE_CODE") === offense_codes.col("CODE"), "left_outer")
-    .select($"DISTRICT",regexp_replace($"NAME", ".-.*$","")as "NAME",$"CODE")
-    .groupBy( "DISTRICT", "NAME", "CODE")
+  //Get crime_type stage 1
+  crime.join(broadcast(offense_codes.dropDuplicates("CODE")), crime.col("OFFENSE_CODE") === offense_codes.col("CODE"), "left_outer")
+    .na.fill("UnknownDistrict")
+    .groupBy( $"DISTRICT",$"NAME")
     .count()
-    .orderBy('count.desc)
-    .as[countName]
-    .groupByKey(_.DISTRICT)
-    .mapGroups{
-      case (key, iter) => iter.toList.sortBy(x => -x.count).take(3)
-    }
-    .toDF("arr")
-    .select(array_distinct($"arr.DISTRICT").getItem(0)as "crimeDISTRICT",array_join($"arr.NAME",", ")as "frequent_crime_type")
-    .createOrReplaceTempView("MAINoffense")
+    .sort('DISTRICT,'count.desc)
+  .createOrReplaceTempView("crime_type")
+  //Get crime_type stage 2
+  spark.sql("select * from (" +
+      "SELECT DISTRICT, NAME, count, " +
+      "row_number() OVER (partition by DISTRICT order by count desc) as country_rank " +
+      "FROM crime_type) ranks " +
+    "where country_rank <= 3")
+     .groupBy($"DISTRICT").agg(array_join(collect_list(regexp_replace($"NAME", ".-.*$","")as "NAME"),", ")as "frequent_crime_types")
+    //.show(50,false)
+    .createOrReplaceTempView("frequent_crime_type")
 
-  val parquet = spark.sql("SELECT MAINresult.DISTRICT," +
-    "MAINresult.crimes_total," +
-    "MAINresult.crimes_monthly," +
-    "MAINoffense.frequent_crime_type," +
-    "MAINresult.lat," +
-    "MAINresult.lng FROM MAINresult LEFT JOIN MAINoffense ON MAINresult.DISTRICT = MAINoffense.crimeDISTRICT")
+  spark.sql("SELECT a.DISTRICT, " +
+    "a.crimes_total, " +
+    "b.crimes_monthly, " +
+    "c.frequent_crime_types, " +
+    "a.lat, " +
+    "a.lng FROM MAINresult a " +
+    "LEFT JOIN median b ON a.DISTRICT = b.DISTRICT " +
+    "LEFT JOIN frequent_crime_type c ON a.DISTRICT = c.DISTRICT")
+    //.show(false)
     .repartition(1)
     .write
     .format("parquet")
     .mode("append")
     //.save("/home/admin/Downloads/my.parquet")
     .save(pathToParquet)
-
 }
